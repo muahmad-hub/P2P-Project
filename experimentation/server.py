@@ -3,7 +3,6 @@ import socket
 import selectors
 import types
 
-
 def accept_wrapper(sock):
     new_sock, address = sock.accept()
     print(f"Accepted connection form {address}")
@@ -50,6 +49,7 @@ print(f"Listening on host: {HOST}, port: {PORT}")
 # Ensure the listening socker doesn't block the server execution and hang
 lsock.setblocking(False)
 # Registering the selector to the listening socket for reading 
+# Action is set to read so the selector will notify when the socket is ready for reading 
 sel.register(lsock, selectors.EVENT_READ, data=None)
 
 try:
@@ -57,9 +57,12 @@ try:
         # Returns all the sockets that are ready for read/write | checks infintely | returns a list of (key, mask)
         # key is an object that sort of acts like a data container. It can contain either the listening socket (if a new connection is requested) or could contain a client socket(if they want to send or receive data)
         # mask tells whether it is a read or write
+        # Timeout is set to None so that server will always wait for one or more requests
         events = sel.select(timeout=None)
         for key, mask in events:
             # If new connection, then accept it
+            # Data is custom meta data that is defined when the socket is built
+            # If data is None, then request came from listening socket
             if key.data is None:
                 accept_wrapper(key.fileobj)
             else:

@@ -44,3 +44,15 @@
         - The messages itself
         - The output buffer
 
+## Date: August 18
+### Notes:
+- For a multi connection server, you can keep one main listening socket. This socket is responsible for finding and receiving new connection requests from clients.
+- Its `data` attribute can be set to `None` when the listening socket is created so that it can be distinguished when a request is received from a client and when from the listening socket
+- For servicing a connection, you don't need to read the data in a loop untill of it is read for a non-blocking socket. This is becasue the OS will notify if there is more data that needs to be read
+### What I did
+- Started creating the bases for the peer-to-peer networking
+- Created a `Members` class which is responsible for everything related to the Peer: it handles creation of the listening socket, accepting new connections and servicing the connections
+    - `create_listening_socket()` creates a non-blocking listening socket that is able to service 5 connections at once. 'Data' is set to "LISTEN" to allow the server to differentiate between a new connection request and a client (other peer) request
+    - `start_listening()` runs the loop and services a request accordingly
+    - `start_server()` runs the listening sockets in a thread for asynchronous processing. Daemon is set to True so that threading terminates once main program stops
+- For scalability instead of just using `types.SimpleNameSpace` or a dictionary, I decided to use a dedicated class to store all the information
