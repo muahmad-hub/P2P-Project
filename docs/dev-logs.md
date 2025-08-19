@@ -56,3 +56,13 @@
     - `start_listening()` runs the loop and services a request accordingly
     - `start_server()` runs the listening sockets in a thread for asynchronous processing. Daemon is set to True so that threading terminates once main program stops
 - For scalability instead of just using `types.SimpleNameSpace` or a dictionary, I decided to use a dedicated class to store all the information
+- Also Implemented `SO_REUSEADDR` to prevent "Address already in use" errors during development iterations—critical for rapid testing cycles.
+
+## Date: August 19
+- To fully create a P2P network, each peer/member would need to store a peer list which contains all the peer known by that specific member fo the network.
+- This list can be shared between members when they connect, allowing for easier discovery of peers
+- A peer network list would also be needed to be generated as an adjacency matrix so that different peers can communicate with each other indirectly (if A is connected to B, C and D, but B is only connected to A, B can talk to both C and D through A.) This is a much more effecient network compared to each member connecting to every single user.
+- Each peer will need to act as a mini-server, mini-client and even a router to help route a message to the network
+- I would also need to use a search algorithm to search for the most optimised path when the message should be routed through. I would most likely be using BFS
+- For effective routing, each peer would need to have a routing table. This will store which peer to send the message too according to the target user. This will be personalized to each member and will be computed beforehand for effeciency.
+- The routing table will also be updated everytime there is an update to the connection
