@@ -66,3 +66,46 @@
 - I would also need to use a search algorithm to search for the most optimised path when the message should be routed through. I would most likely be using BFS
 - For effective routing, each peer would need to have a routing table. This will store which peer to send the message too according to the target user. This will be personalized to each member and will be computed beforehand for effeciency.
 - The routing table will also be updated everytime there is an update to the connection
+
+## Date: August 20
+### Overall Plan
+- I am planning on breaking the problem down into smaller chunks and completing each chunk at a time rather than completing all at once, as I was trying before.
+- Previously, I was attempting to build the Message, Peer, and Router classes all at once, which was disorienting and often caused me to get stuck.
+### First step: Message Class
+- My current plan is to first create the Message class.
+    - The message class must be able to track:
+        - The number of hops it has taken
+        - The path it has traversed so far
+### Second step: Router Class
+- I need to implement the `Router` class that:
+    - Maintains a network structure
+    - Find shortest path between two nodes/peers via BFS
+    - Generate routing tables for effeciency
+    - Have a way to handle disconnected peers in the routing table and the network structure
+    - Have a way to update new connections in the routing table and the network structure
+### Third step: Complete the PeerConnection Class
+- This class should be able to:
+    - Handle connections with buffereing
+    - Handle partial messages
+    - Queue outbound messages
+    - Detect complete messages
+- I had already completed most of this in the previous days, so I only need to work on the queuing outbound messages part
+### Fourth step: Complete Peer discovery and Handshake (Peer Class)
+- This class should be able to:
+    - Accept incoming connections on a listening socket
+    - Initiate connections with peers
+    - Perform handshake (application level) to exchange information between peers
+    - Share a peer list
+    - Handle connection failures
+- I have also added a check in `handle_message()` method so that message don't just get stuck in loops
+### BFS vs Dijkstra
+- For routing between peers I decided to use BFS instead of Dijkstra algorithm because currently my edges are unweighted (Each hop has the same weight/cost) and so BFS would be much faster and quicker here.
+- I might use Dijkstra later on if I add weighted edges (such as latency or bandwidth)
+### BUG
+- There seems to be a problem with the handshake request. The peer list is not being updated when teh results are shown
+    - ```python 
+        Handshake sent!
+        Peer1 knows: []
+        Peer2 knows: []
+    ```
+- I will try and fix this tommorow
