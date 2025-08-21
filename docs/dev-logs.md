@@ -71,26 +71,26 @@
 ### Overall Plan
 - I am planning on breaking the problem down into smaller chunks and completing each chunk at a time rather than completing all at once, as I was trying before.
 - Previously, I was attempting to build the Message, Peer, and Router classes all at once, which was disorienting and often caused me to get stuck.
-### First step: Message Class
+### ✅ First step: Message Class
 - My current plan is to first create the Message class.
     - The message class must be able to track:
         - The number of hops it has taken
         - The path it has traversed so far
-### Second step: Router Class
+### ✅ Second step: Router Class
 - I need to implement the `Router` class that:
     - Maintains a network structure
     - Find shortest path between two nodes/peers via BFS
     - Generate routing tables for effeciency
     - Have a way to handle disconnected peers in the routing table and the network structure
     - Have a way to update new connections in the routing table and the network structure
-### Third step: Complete the PeerConnection Class
+### ✅ Third step: Complete the PeerConnection Class
 - This class should be able to:
     - Handle connections with buffereing
     - Handle partial messages
     - Queue outbound messages
     - Detect complete messages
 - I had already completed most of this in the previous days, so I only need to work on the queuing outbound messages part
-### Fourth step: Complete Peer discovery and Handshake (Peer Class)
+### ✅ Fourth step: Complete Peer discovery and Handshake (Peer Class)
 - This class should be able to:
     - Accept incoming connections on a listening socket
     - Initiate connections with peers
@@ -109,3 +109,275 @@
         Peer2 knows: []
     ```
 - I will try and fix this tommorow
+
+## Date: August 21
+### FIX
+- In the test, I used raw socket (that wasn't managed by the selector) so when the handshake is sent to Peer1, Peer2's handshake is not received.
+- `to_json` and `from_json` were not converting the hop count or the path
+- In the test, I had `\\n` instead of `\n`, this may have caused the problem too
+- I also need to implement the sending of peer list
+- For sending message, my previous code had a bug
+    - ```python
+        # Previous approach
+        def route_message(self, message):
+            target = message.target_user_id
+            send_to = self.router.routing_graph.get(target)
+            if send_to is None:
+                print("Unable to send message")
+                return None
+            self.send_message(message)
+
+        # New approach
+        # Sends message to the next hop
+        def route_message(self, message):
+            target = message.target_user_id
+            next_hop = self.router.routing_graph.get(target)
+            if next_hop is None:
+                print(f"No route to {target}")
+                return False
+            
+            if next_hop in self.connections:
+                message.add_hop(self.peer_id)
+                self.connections[next_hop].queue_message(message)
+                return True
+            else:
+                print(f"Next hop {next_hop} not connected")
+                return False
+        ```
+### ✅ Fifth Step: Error handling in Message class
+- For network, errors can cause the whole network to crash and so are extremely important to be caught wherever they can
+- Added the following to make sure there are no crashes if json is not parsed properly
+    - ```python 
+            try:
+                data = json.loads(json_str)
+            except json.JSONDecodeError:
+                return None
+        ```
+- Added a check for all the required fields too in `from_json`
+    - ```python 
+        required_fields = ["peer_id", "target_user_id", "message_type", "data", "time_stamp", "message_id"]
+        if not all(field in data for field in required_fields):
+            return None
+        ```
+- Added a check for each message attribute to ensure data is not corrupted:
+    - ```python
+        if not isinstance(data["peer_id"], str): return None
+        if not isinstance(data["target_user_id"], (str, type(None))): return None
+        if not isinstance(data["message_type"], str): return None
+        if not isinstance(data["data"], dict): return None
+        if not isinstance(data["time_stamp"], (int, float)): return None
+        if not isinstance(data["message_id"], str): return None
+        if not isinstance(data.get("hop_count", 0), int): return None
+        if not isinstance(data.get("path", []), list): return None
+        ```
+- I had previously already added a `seen_message` list in the peer class to prevent messages being sent in loops. I added an additiional check so that users don't change the message id and keep sending the messages infinitely
+    - ```python
+        if data.get("hop_count", 0) > 10:
+        return None
+        ```
+### ✅ Sixth Step: Remove disconnected peers through Router class   
+- Incase a peer disconnects, I need to add a method that will remove the peer from the peer graph, routing graph and connections.
+    - ```python
+        def remove_peer(self, other_peer_id):
+        """
+        Removes disconnected peers from Router
+        """
+
+        # Remove from peer graph
+        if other_peer_id in self.peer_graph:
+            del self.peer_graph[other_peer_id]
+        
+        # Remove from routing graph
+        # Using keys_to_remove list to prevent editing the dictionary while iterating over it
+        keys_to_remove = []
+        for destination, hop in self.routing_graph.items():
+            if destination == other_peer_id or hop == other_peer_id:
+                keys_to_remove.append(destination)
+        for key in keys_to_remove:
+            del self.routing_graph[key]
+
+        # Remove from other peers' connection
+        for other_peer, connection in self.peer_graph.items():
+            if other_peer_id in connection:
+                connection.remove(other_peer_id)
+
+        ```
+### ✅ Seventh Step: Network error handling in PeerConnection class, enforce buffer size, and ensure clean up of unused connections
+- `BlockingIOError` error is raised when a I/O operation is performed on a non-blocking socket that would normally block. 
+    - When using `send()` this means that the OS send buffer is full and so can't write now. 
+    - When  using `recv()` this means that no data is available yet
+    - Both signal to try later
+- `ConnectionResetError` happens when peer closes connection when data is being sent
+- I added a seperate `send_buffered_data` method which handles these errors:
+    - ```python 
+        def send_buffered_data(self):
+            """
+            Sends data in the outbound buffer with Error handling
+            Returns the following:
+                True: if the outbound buffer is empty
+                False: if there is still data left in the buffer
+                None: if connection closed or broke
+            """
+            # Checks if outbound buffer is empty (all the data is already sent)
+            if not self.outbound_buffer:
+                return True
+            
+            try:
+                sent = self.socket.send(self.outbound_buffer)
+                self.outbound_buffer = self.outbound_buffer[sent:]
+                # Returning False to signal data is still left to be sent in the bufer
+                return True if not self.outbound_buffer else False
+            except BlockingIOError:
+                # Returning False to signal to try later as OS send buffer is full
+                return False
+            except ConnectionResetError:
+                # Returning None to indicate that connection has closed
+                return None
+        ```
+- Set a maximum buffer size in the `PeerConnection` class to avoid memory exhaustion, network congestion, and latency
+    - ```python
+        # Handling maximum buffer size overflow
+        if len(self.outbound_buffer) + len(message_bytes) > self.MAX_BUFFER_SIZE:
+            print(f"Maximum buffer sized reached on outbound buffer for {self.address}")
+            return False
+        ```
+### ✅ Testing current code:
+### 🧪 First Test
+- Tested basic connection first
+ ```python
+    if __name__ == "__main__":    
+        print("___Test: Basic Connection___")
+        
+        # Create two peers
+        peer1 = Peer("localhost", 8001)
+        peer2 = Peer("localhost", 8002)
+        
+        peer1.start_server()
+        peer2.start_server()
+        
+        print(f"Peer1 ID: {peer1.peer_id}")
+        print(f"Peer2 ID: {peer2.peer_id}")
+        
+        time.sleep(0.5)
+        
+        success = peer2.connect_to_peer("localhost", 8001)
+        if success:
+            print("Connection initiated successfully")
+        
+        time.sleep(1)
+        
+        print(f"Peer1 known peers: {list(peer1.known_peers.keys())}")
+        print(f"Peer2 known peers: {list(peer2.known_peers.keys())}")
+```
+### Failed Test:
+ ```python 
+    ___Test: Basic Connection___
+    Listening socket created for member c22614c6
+    Listening socket created for member 794dada3
+    Peer1 ID: c22614c6
+    Peer2 ID: 794dada3
+    Failed to connect to localhost:8001
+    Peer1 known peers: []
+    Peer2 known peers: []
+```
+### Solution
+- I ran the code in the debugger and when the `connect_ex()` method was used, it gave back `10035` instead of `0`. After searching up what the error code mean't, I learn't that this error is for windows which signals that the socket is not yet ready for the action. 
+- So I added another condition to ignore this code:
+- ```python
+    if result != 0 and result != 10035:
+        sock.close()
+        print(f"Failed to connect to {host}:{port}")
+        return False
+    ```
+- After these changes the handshake and connection did work
+### Second Test
+- Testing messages and routing
+```python
+    def test2():
+        print("__Test 2: Message routing")
+        
+        # Create three peers for routing test
+        peer1 = Peer("localhost", 8003)
+        peer2 = Peer("localhost", 8004) 
+        peer3 = Peer("localhost", 8005)
+        
+        # Start all servers
+        peer1.start_server()
+        peer2.start_server()
+        peer3.start_server()
+        
+        print(f"Peer1 ID: {peer1.peer_id}")
+        print(f"Peer2 ID: {peer2.peer_id}")
+        print(f"Peer3 ID: {peer3.peer_id}")
+        
+        time.sleep(0.5)
+
+        # Establishing network        
+        peer1.connect_to_peer("localhost", 8004) 
+        time.sleep(0.5)
+        peer2.connect_to_peer("localhost", 8005)
+        time.sleep(1.5)
+        
+        print("Network established")
+        print(f"Peer1 knows: {list(peer1.known_peers.keys())}")
+        print(f"Peer2 knows: {list(peer2.known_peers.keys())}")
+        print(f"Peer3 knows: {list(peer3.known_peers.keys())}")
+        
+        # Test direct messages (peer1 to peer2)
+        print("__Testing direct message___")
+        direct_message = Message(
+            peer_id=peer1.peer_id,
+            target_user_id=peer2.peer_id,
+            message_type="MESSAGE",
+            data={"content": "Hello from peer1 to peer2!"},
+            time_stamp=time.time()
+        )
+        peer1.send_message(direct_message)
+        
+        time.sleep(0.5)
+        
+        # Test routed message (peer1 to peer3 via peer2)
+        print("___Testing routed message___")
+        routed_message = Message(
+            peer_id=peer1.peer_id,
+            target_user_id=peer3.peer_id,
+            message_type="MESSAGE",
+            data={"content": "Hello from peer1 to peer3 via routing!"},
+            time_stamp=time.time()
+        )
+        peer1.send_message(routed_message)
+        
+        time.sleep(0.5)
+        
+        return peer1, peer2, peer3
+```
+### Failed test:
+- Direct messages between peer1 and peer2 were sent, but the message couldn't be routed through the peers
+### Solution:
+- Running the code in debugger showed that the error was coming due to the `self.router.routing_graph.get(target)` returning `None`. So I added another line to the testing code to see the known peers.
+    ```python
+    # Testing code
+    print(f"Peer 1 knows: {peer1.known_peers.keys()}")
+    print(f"Peer 2 knows: {peer2.known_peers.keys()}")
+    print(f"Peer 3 knows: {peer3.known_peers.keys()}")
+
+    # Output
+    Peer 1 knows: dict_keys(['56337cbe'])
+    Peer 2 knows: dict_keys(['4f3d67ab', 'f5a0e9d8'])
+    Peer 3 knows: dict_keys(['56337cbe', '4f3d67ab'])
+    ```
+- This clarifies that Peer 1 is still not notified that Peer 3 exists and so couldn't route the message
+- So I added the following changes to whever a handshake request is replied to:
+    ```python
+        for existing_peer_id, existing_connection in self.connections.items():
+        if existing_peer_id != other_peer_id and existing_connection.is_handshake_complete:
+            # Send the updated known_peers list to existing connections
+            updated_peer_list = Message(
+                peer_id=self.peer_id,
+                target_user_id=existing_peer_id,
+                message_type="PEER_LIST",
+                data=self.known_peers,
+            )
+            existing_connection.queue_message(updated_peer_list)
+        ```
+- However, there still seems to be a routing problem
