@@ -71,26 +71,26 @@
 ### Overall Plan
 - I am planning on breaking the problem down into smaller chunks and completing each chunk at a time rather than completing all at once, as I was trying before.
 - Previously, I was attempting to build the Message, Peer, and Router classes all at once, which was disorienting and often caused me to get stuck.
-### ✅ First step: Message Class
+###  ✔ First step: Message Class
 - My current plan is to first create the Message class.
     - The message class must be able to track:
         - The number of hops it has taken
         - The path it has traversed so far
-### ✅ Second step: Router Class
+### ✔ Second step: Router Class
 - I need to implement the `Router` class that:
     - Maintains a network structure
     - Find shortest path between two nodes/peers via BFS
     - Generate routing tables for effeciency
     - Have a way to handle disconnected peers in the routing table and the network structure
     - Have a way to update new connections in the routing table and the network structure
-### ✅ Third step: Complete the PeerConnection Class
+### ✔ Third step: Complete the PeerConnection Class
 - This class should be able to:
     - Handle connections with buffereing
     - Handle partial messages
     - Queue outbound messages
     - Detect complete messages
 - I had already completed most of this in the previous days, so I only need to work on the queuing outbound messages part
-### ✅ Fourth step: Complete Peer discovery and Handshake (Peer Class)
+### ✔ Fourth step: Complete Peer discovery and Handshake (Peer Class)
 - This class should be able to:
     - Accept incoming connections on a listening socket
     - Initiate connections with peers
@@ -107,7 +107,7 @@
         Handshake sent!
         Peer1 knows: []
         Peer2 knows: []
-    ```
+        ```
 - I will try and fix this tommorow
 
 ## Date: August 21
@@ -144,7 +144,7 @@
                 print(f"Next hop {next_hop} not connected")
                 return False
         ```
-### ✅ Fifth Step: Error handling in Message class
+### ✔ Fifth Step: Error handling in Message class
 - For network, errors can cause the whole network to crash and so are extremely important to be caught wherever they can
 - Added the following to make sure there are no crashes if json is not parsed properly
     - ```python 
@@ -175,7 +175,7 @@
         if data.get("hop_count", 0) > 10:
         return None
         ```
-### ✅ Sixth Step: Remove disconnected peers through Router class   
+### ✔ Sixth Step: Remove disconnected peers through Router class   
 - Incase a peer disconnects, I need to add a method that will remove the peer from the peer graph, routing graph and connections.
     - ```python
         def remove_peer(self, other_peer_id):
@@ -202,7 +202,7 @@
                 connection.remove(other_peer_id)
 
         ```
-### ✅ Seventh Step: Network error handling in PeerConnection class, enforce buffer size, and ensure clean up of unused connections
+### ✔ Seventh Step: Network error handling in PeerConnection class, enforce buffer size, and ensure clean up of unused connections
 - `BlockingIOError` error is raised when a I/O operation is performed on a non-blocking socket that would normally block. 
     - When using `send()` this means that the OS send buffer is full and so can't write now. 
     - When  using `recv()` this means that no data is available yet
@@ -241,7 +241,7 @@
             print(f"Maximum buffer sized reached on outbound buffer for {self.address}")
             return False
         ```
-### ✅ Testing current code:
+### ✔ Testing current code:
 ### 🧪 First Test
 - Tested basic connection first
  ```python
@@ -382,7 +382,7 @@
         ```
 - However, there still seems to be a routing problem
 
-## Date: August 21
+## Date: August 22
 ### Solution for yesterday's BUG
 - I was successfully sending peer list to all the connected users when a new user connected. This mean't that peers knew which other peers exist, but they still don't know which peer is connected to which peer and hence don't have the full idea of the network structure. 
 - This is what was causing the BFS to fail and not be able to route peers correctly
@@ -398,7 +398,7 @@
         existing_connection.queue_message(updated_network)
     ```
 - After this change, the routing test did work
-### ✅ Eigth Step: Adding CLI for user interface
+### ✔ Eigth Step: Adding CLI for user interface
 - I implemented a new `cli_interface` class that provides a **command-line interface** for interacting with the P2P network
 - This allows users to connect, send messages, view peer lists, check system status, show help commands and close the Peer all through the terminal
 ### Key features added:
@@ -409,3 +409,54 @@
 - `status` displays system statistics (per ID, running status, routing, etc...)
 - `help` list all commands
 - `quit`/`exit` closes current peer
+
+## Date: August 23
+### ✔ Ninth Step: Adding message queuing for offline peers
+- Incase a peer is not currently connected, I do want to have the option of storing the message on a database so that it can be sent later when the user comes back online
+### Chosing sqlite3 vs PostgreSQL
+- Although PostgreSQL offers stronger security, advanced features and better scalability, sqlite3 is more compact, portable and easier to integrate as an embedded database. Since my goal is to store messages locally for offline users, sqlite3 seems to be a better choice
+### Choosing between 1 table vs 2 tables for storing offline messages
+- As of now I have two types of data that I need to store in the database: the main message data and the schedule data associated with the message
+- Using a single table really reduces the query complexities but it also hinders scalability. From my previous projects I have learn't that scalable code may be time consuming or complex for now but it is extremely helpful in the future when new features are added or code is extended
+- Therefore, I am thinking of using a 2 table solution:
+    - `offline_messages`: stores all the data releated to the message, eg. peer_id, target_peer, data...
+    - `schedule_messages`: stores data realted to the message scheduling, eg. last_tried, retry_count, expiry_time...
+### What I did
+- I added a `MessageStore` class that handles storing offline messages with the following methods:
+    - `initialize_database`: Initializes and creates the two tables in the database
+    - `store_offline_message`: Stores the message that is forwarded as a paremeter in the database
+    - `delete_expired_messages`: Delets any expired messages from the database.
+    - `get_pending_messages`: Retrives messages still pending that where the receipent is the target user. It also calls the `delete_expired_messages` inside itself.
+    - `get_message_by_id`: gets a specific message stored in the message store through the message id
+    - `delete_message_by_id`: deletes a specific message in message store through the message id
+    - `increment_retry_count`: increments the retry count by one and also updates the last_tried field in message store. Returns the new retry count at the end
+- I added the following methods too the `Peer` class too:
+    - `queue_offline_message`: it is called when the message can't be sent to the peer right now (as they are not connected yet). Stores the message in the message store
+    - `retry_sending_message`: keeps sending message to disconnected user untill the retry count is reached
+    - `deliver_queued_messages`: is called when a users handshake is received and checks if there are any queued messages that weren't sent to them when they disconnected
+### Problem 1: Message type inconsistency
+- I was storing message class in database as seperate pieces of data, and I was returning the data in the `get_message_by_id` and `get_pending_messages` methods instead of message class
+### Solution:
+- I decided to add a `data_to_message_class` method that converts the the raw data into a message class
+### Problem 2: Peer ID regenerated
+- I didn't think of this problem beforehand but everytime a peer is connects, regardless of wether they connect for first time or reconnect, they are given a new peer id. This causes a problem as the whole storing and queuing offline messages code that I wrote is based on the fact that each peer will have the same id whenever they reconnect
+### Solution:
+- I decided to store user peer id locally through the new `load_or_create_peer_id` method, which loads or creates a peer id. If the user is a first time user then a new file is created where their peer id is stored, else their peer id is retreived from the file which is stored locally
+### Problem 3: showing Unknown Peer for offline messages
+- While testing, when I would disconnect a peer and try to send them a message, the system wouldn't recognise the peer, which mean't that it wasn't in their known peers.
+### Solution
+- This part of the code was the proble,
+```python
+def cleanup_connection(self, connection, sock):
+    """
+    Removes connection and peer from memeory and from router
+    """
+    self.sel.unregister(sock)
+    sock.close()
+    if connection.peer_id:
+        self.connections.pop(connection.peer_id, None)
+        # This was the problem causing the isse
+        self.known_peers.pop(connection.peer_id, None)
+        self.router.remove_peer(connection.peer_id)
+```
+- `self.known_peers.pop(connection.peer_id, None)` removed the peer from known peers when they disconnected and hence the message couldn't be queued for later

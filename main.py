@@ -6,12 +6,14 @@ import threading
 from collections import deque
 import time
 import sys
+import sqlite3
+import os
 
 class Peer:
     def __init__(self, host, port):
         self.host = host
         self.port = port
-        self.peer_id = uuid.uuid4().hex[:8]
+        self.peer_id = self.load_or_create_peer_id()
         self.sel = selectors.DefaultSelector()
         self.is_socket_running = False
         # Listening socket
@@ -20,6 +22,24 @@ class Peer:
         self.known_peers = {}
         self.connections = {}
         self.seen_messages = set()
+        # Setting message_store for storing offline messages and retry scheduler
+        self.message_store = MessageStore(self.peer_id)
+        self.retry_scheduler = {}
+
+    def load_or_create_peer_id(self):
+        """
+        If first time user, then a new id is created for them and stored locally
+        If not first time user, then the peer id is retreived
+        """
+        peer_id_file = f"ids/peer_{self.host}_{self.port}.id"
+        if os.path.exists(peer_id_file):
+            with open(peer_id_file, 'r') as f:
+                return f.read().strip()
+        else:
+            new_id = uuid.uuid4().hex[:8]
+            with open(peer_id_file, 'w') as f:
+                f.write(new_id)
+            return new_id
 
     def create_listening_socket(self):
         """
@@ -49,8 +69,8 @@ class Peer:
                         self.accept_new_connection()
                     else:
                         self.service_connection(key, mask)
-        except:
-            print("ERROR: listen socket couldn't listen")
+        except Exception as e:
+            print(f"ERROR: {e}")
 
     def start_server(self):
         self.create_listening_socket()
@@ -118,6 +138,8 @@ class Peer:
 
     def handle_handshake(self, message, connection):
         """
+        Handles a peers incoming handshake
+
         PSEUDOCODE:
             Get peer id
             Add peer id to connection
@@ -131,6 +153,7 @@ class Peer:
         other_peer_id = message.peer_id
 
         print(f"Handshake from {other_peer_id}")
+        print
 
         # Add peer to current conenctions
         self.connections[other_peer_id] = connection
@@ -153,6 +176,9 @@ class Peer:
         # Socket data is updated
         connection.peer_id = other_peer_id
         connection.is_handshake_complete = True
+
+        # Deliver any message that was queued for this peer
+        self.deliver_queued_messages(other_peer_id)
 
         # Peer list is sent
         peer_list_message = Message(peer_id=self.peer_id, target_user_id=other_peer_id, message_type="PEER_LIST", data=self.known_peers, time_stamp=time.time())
@@ -187,7 +213,7 @@ class Peer:
 
     def handle_user_message(self, message):
         if message.target_user_id == self.peer_id:
-            print(f"Message from {message.peer_id}: {message.data.get('content', '')}")
+            print(f"Message from {message.peer_id} at {message.time_stamp}: {message.data.get('content', '')}")
         else:
             self.route_message(message)
 
@@ -239,7 +265,8 @@ class Peer:
         next_hop = self.router.routing_graph.get(target)
         
         if next_hop is None:
-            print(f"No route to {target}")
+            print(f"No route to {target}, queing for later")
+            self.queue_offline_message(message)
             return False
         
         if next_hop in self.connections:
@@ -248,7 +275,8 @@ class Peer:
             print(f"Forwarded message for {target} via {next_hop}")
             return True
         else:
-            print(f"Next hop {next_hop} not connected")
+            print(f"Next hop {next_hop} not connected, queing for later")
+            self.queue_offline_message(message)
             return False
 
     def send_message(self, message):
@@ -261,6 +289,84 @@ class Peer:
             return True
         else:
             return self.route_message(message)
+
+    def queue_offline_message(self, message):
+        """
+        Queues offline message and stores in the message store 
+
+        PSEUDOCODE:
+            store message in database
+            start a thread to retry sending message (through retry function)
+            store the thread in the retry dictinary 
+        """
+        self.message_store.store_offline_message(message)
+
+        timer = threading.Timer(1.0, self.retry_sending_message, [message.message_id])
+        timer.start()
+        self.retry_scheduler[message.message_id] = timer
+
+    def retry_sending_message(self, message_id):
+        """
+        PSEUDOCODE:
+            set a delay and retry_count limit
+            get stored message through message id
+            call route_message function
+            if success then print success message
+            else increment retry_count 
+            if retry_count limit is reached then stop sending messages for now
+            else retry sending the message
+        """
+        delay = 30.0
+        retry_count_limit = 10
+
+        message = self.message_store.get_message_by_id(message_id)
+        
+        if not message:
+            print(f"Message {message_id} not found for retry")
+            return
+        
+        target = message.target_user_id
+        next_hop = self.router.routing_graph.get(target)
+        
+        success = False
+        if next_hop and next_hop in self.connections:
+            message.add_hop(self.peer_id)
+            self.connections[next_hop].queue_message(message)
+            print(f"Successfully sent queued message to {target} via {next_hop}")
+            success = True
+        elif target in self.connections:
+            message.add_hop(self.peer_id)
+            self.connections[target].queue_message(message)
+            print(f"Successfully sent queued message directly to {target}")
+            success = True
+        
+        if success:
+            self.message_store.delete_message_by_id(message_id)
+            if message_id in self.retry_scheduler:
+                self.retry_scheduler.pop(message_id, None)
+        else:
+            retry_count = self.message_store.increment_retry_count(message_id)
+            print(f"Retry attempt {retry_count} failed for message to {target}")
+
+            if retry_count >= retry_count_limit:
+                print(f"Retry limit reached for message to {target}, stopping retries")
+                self.message_store.delete_message_by_id(message_id)
+                if message_id in self.retry_scheduler:
+                    self.retry_scheduler.pop(message_id, None)
+            else:
+                timer = threading.Timer(delay, self.retry_sending_message, [message_id])
+                timer.start()
+                self.retry_scheduler[message_id] = timer
+
+    def deliver_queued_messages(self, target_peer):
+        messages = self.message_store.get_pending_messages(target_peer)
+
+        if messages:
+            for i, message in enumerate(messages):
+                self.send_message(message)
+                print(f"Sent {i+1} queued message")
+
+            print("Sent all previously queued messages")
 
     def connect_to_peer(self, host, port):
         try:
@@ -296,9 +402,8 @@ class Peer:
         sock.close()
         if connection.peer_id:
             self.connections.pop(connection.peer_id, None)
-            self.known_peers.pop(connection.peer_id, None)
             self.router.remove_peer(connection.peer_id)
-        print(f"Cleaned up connection {connection.address}")
+        print(f"\nCleaned up connection {connection.address}")
    
     def close_current_peer(self):
         """
@@ -465,6 +570,233 @@ class Message:
     def add_hop(self, peer_id):
         self.hop_count += 1
         self.path.append(peer_id)
+
+class MessageStore:
+    """
+    Stores offline messages to send to users who aren't currently connected to the network
+
+    PSEUDOCODE:
+        Class MessageStore
+
+            creates a message database for a peer
+            Needs a message table to store relevant message data
+            Add a schedule table, connect it as a one to one field to the message table
+            Schedule table should store:
+                - Last tried timestamp
+                - Number of times it was tried to send
+                - Expiry timestamp (so that the message isn't being sent forever)
+
+            Function inititialize database:
+                create the two necessary tables
+
+            Function store_offline_message(message):
+                store the message in the database
+                add expiry timestamp of 7 days from now
+
+            Function get_pending_messages(target user):
+                delete any messages whose expirty date has exceeded
+                search the database where intended user is the target user
+    """
+    def __init__(self, peer_id):
+        self.peer_id = peer_id
+        # Each peer has their own database
+        self.database_path = f"database/{self.peer_id}_messages.db"
+
+        os.makedirs("database", exist_ok=True)
+
+        self.initialize_database()
+
+    def initialize_database(self):
+        connection = sqlite3.connect(self.database_path)
+        cursor = connection.cursor()
+
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS offline_messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            peer_id TEXT NOT NULL,
+            target_user_id TEXT NOT NULL,
+            message_type TEXT NOT NULL,
+            data TEXT NOT NULL,
+            time_stamp DATETIME,
+            message_id TEXT NOT NULL,
+            hop_count INTEGER,
+            path TEXT
+            )
+        """)
+
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS schedule_messages (
+            message_id TEXT PRIMARY KEY,
+            last_tried DATETIME,
+            retry_count INTEGER DEFAULT 0,
+            expiry_time DATETIME, 
+            FOREIGN KEY(message_id) REFERENCES offline_messages(message_id) ON DELETE CASCADE
+            )
+        """)
+
+        connection.commit()
+        connection.close()
+
+    def store_offline_message(self, message):
+        connection = sqlite3.connect(self.database_path)
+        cursor = connection.cursor()
+
+        # Expiry time is set to 7 days from when message was stored in database
+        expiry_time = time.time() + 604800
+
+        cursor.execute("""
+        INSERT INTO offline_messages
+        (peer_id, target_user_id, message_type, data, time_stamp, message_id, hop_count, path) 
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            message.peer_id,
+            message.target_user_id,
+            message.message_type,
+            json.dumps(message.data),
+            message.time_stamp,
+            message.message_id,
+            message.hop_count,
+            json.dumps(message.path)
+        ))
+
+        cursor.execute("""
+        INSERT INTO schedule_messages
+        (message_id, last_tried, retry_count, expiry_time)
+        VALUES (?, ?, ?, ?)
+        """, (
+            message.message_id,
+            None,
+            0,
+            expiry_time
+        ))
+
+        connection.commit()
+        connection.close()
+
+    def get_pending_messages(self, target_peer):
+        connection = sqlite3.connect(self.database_path)
+        cursor = connection.cursor()
+
+        self.delete_expired_messages()
+
+        # Query to retrieve all messages where the target is the target_peer and message hasn't expired yet
+        cursor.execute("""
+        SELECT o.id, o.peer_id, o.target_user_id, o.message_type, o.data, 
+            o.time_stamp, o.message_id, o.hop_count, o.path,
+            s.last_tried, s.retry_count, s.expiry_time
+        FROM offline_messages o
+        JOIN schedule_messages s ON o.message_id = s.message_id
+        WHERE o.target_user_id = ? AND s.expiry_time > ?
+        """, (target_peer, time.time()))
+
+        result_raw = cursor.fetchall()
+        connection.close()
+
+        messages = []
+        for result in result_raw:
+            messages.append(self.data_to_message_class(result))
+
+        return messages
+
+    def get_message_by_id(self, message_id):
+        connection = sqlite3.connect(self.database_path)
+        cursor = connection.cursor()
+
+        self.delete_expired_messages()
+
+        # Query to retrieve all messages where the target is the target_peer and message hasn't expired yet
+        cursor.execute("""
+        SELECT o.id, o.peer_id, o.target_user_id, o.message_type, o.data, 
+            o.time_stamp, o.message_id, o.hop_count, o.path,
+            s.last_tried, s.retry_count, s.expiry_time
+        FROM offline_messages o
+        JOIN schedule_messages s ON o.message_id = s.message_id
+        WHERE o.message_id = ? AND s.expiry_time > ?
+        """, (message_id, time.time()))
+
+        result_raw = cursor.fetchone()
+        connection.close()
+        
+        if result_raw:
+            result = self.data_to_message_class(result_raw)
+            return result   
+        return None     
+
+    def delete_expired_messages(self):
+        """
+        Deletes all the expired messages in the database
+        """
+        connection = sqlite3.connect(self.database_path)
+        cursor = connection.cursor()
+
+        cursor.execute("""
+        DELETE FROM offline_messages
+        WHERE message_id IN (
+            SELECT message_id FROM schedule_messages WHERE expiry_time <= ?
+        )
+        """, (time.time(),))
+
+        connection.commit()
+        connection.close()
+        
+    def delete_message_by_id(self, message_id):
+        connection = sqlite3.connect(self.database_path)
+        cursor = connection.cursor()
+
+        cursor.execute("""
+        DELETE FROM offline_messages 
+        WHERE message_id = ?
+        """, (message_id,))
+
+        connection.commit()
+        connection.close()
+
+    def increment_retry_count(self, message_id):
+        connection = sqlite3.connect(self.database_path)
+        cursor = connection.cursor()
+        
+        # Updates both retry_count and last_tried timestamp
+        cursor.execute("""
+        UPDATE schedule_messages 
+        SET retry_count = retry_count + 1, 
+            last_tried = ?
+        WHERE message_id = ?
+        """, (time.time(), message_id))
+
+        # Gets the new retry count value
+        cursor.execute("""
+        SELECT retry_count 
+        FROM schedule_messages 
+        WHERE message_id = ?
+        """, (message_id,))
+        
+        result = cursor.fetchone()
+        retry_count = result[0] if result else 0
+
+        connection.commit()
+        connection.close()
+
+        return retry_count
+            
+    def data_to_message_class(self, message_data):
+        """
+        Converts the raw message data from the database into a message class
+        """
+        if message_data:
+            message = Message(
+                peer_id=message_data[1],
+                target_user_id=message_data[2],
+                message_type=message_data[3],
+                data=json.loads(message_data[4]),
+                time_stamp=message_data[5]
+            )
+            message.message_id = message_data[6]
+            message.hop_count = message_data[7]
+            message.path = json.loads(message_data[8])
+
+            return message
+        
+        return None
 
 class Router:
     def __init__(self, peer_id):
@@ -638,7 +970,7 @@ class cli_interface:
         target_peer_id = args[0]
         message_content = " ".join(args[1:])
         
-        if target_peer_id not in self.peer.known_peers and target_peer_id not in self.peer.connections:
+        if target_peer_id not in self.peer.known_peers:
             print(f"Unknown peer: {target_peer_id}")
             return
         
@@ -654,7 +986,8 @@ class cli_interface:
         if success:
             print(f"Message sent to {target_peer_id}")
         else:
-            print(f"Failed to send message to {target_peer_id}")
+            print(f"Message queued for {target_peer_id} (will retry when peer comes online)")
+
 
     def cmd_list(self, args):
         """
