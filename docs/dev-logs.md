@@ -381,3 +381,31 @@
             existing_connection.queue_message(updated_peer_list)
         ```
 - However, there still seems to be a routing problem
+
+## Date: August 21
+### Solution for yesterday's BUG
+- I was successfully sending peer list to all the connected users when a new user connected. This mean't that peers knew which other peers exist, but they still don't know which peer is connected to which peer and hence don't have the full idea of the network structure. 
+- This is what was causing the BFS to fail and not be able to route peers correctly
+- So, I added a new message type called `NETWORK_UPDATE` and this new message is transmitted to the peer when they send a handshake and to all other conected peers too
+    ```python
+        updated_network = Message(
+            peer_id=self.peer_id,
+            target_user_id=existing_peer_id,
+            message_type="NETWORK_UPDATE",
+            data={"peer_graph": {key: list(value) for key, value in self.router.peer_graph.items()}},
+            time_stamp=time.time()
+        )
+        existing_connection.queue_message(updated_network)
+    ```
+- After this change, the routing test did work
+### ✅ Eigth Step: Adding CLI for user interface
+- I implemented a new `cli_interface` class that provides a **command-line interface** for interacting with the P2P network
+- This allows users to connect, send messages, view peer lists, check system status, show help commands and close the Peer all through the terminal
+### Key features added:
+- `parse_command()` takes raw user input, splits it into a command and arguments and executes the corresponding function
+- `connect (host) (port)` connects to another peer
+- `send (peer_id) (message)` sends a direct message to a peer
+- `list` shows connected peers and known peers
+- `status` displays system statistics (per ID, running status, routing, etc...)
+- `help` list all commands
+- `quit`/`exit` closes current peer

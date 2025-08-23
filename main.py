@@ -5,6 +5,330 @@ import json
 import threading
 from collections import deque
 import time
+import sys
+
+class Peer:
+    def __init__(self, host, port):
+        self.host = host
+        self.port = port
+        self.peer_id = uuid.uuid4().hex[:8]
+        self.sel = selectors.DefaultSelector()
+        self.is_socket_running = False
+        # Listening socket
+        self.lsock = None
+        self.router = Router(self.peer_id)
+        self.known_peers = {}
+        self.connections = {}
+        self.seen_messages = set()
+
+    def create_listening_socket(self):
+        """
+        Creates listening socket with TCP connection
+        Options set so that address can be reused without error
+        Non-blocking socket
+        """
+        self.lsock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        # Prevents "Address already in use" errors
+        self.lsock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.lsock.bind((self.host, self.port))
+        # Member can only listen for 5 peers at a time 
+        self.lsock.listen(5)
+        self.lsock.setblocking(False)
+        self.sel.register(self.lsock, selectors.EVENT_READ, data="LISTEN")
+        print(f"Listening socket created for member {self.peer_id}")
+
+    def start_listening(self):
+        """
+        Listening socket checks for whether incoming request is by previous client or a new client
+        """
+        try:
+            while self.is_socket_running:
+                events = self.sel.select(timeout=1)
+                for key, mask in events:
+                    if key.data == "LISTEN":
+                        self.accept_new_connection()
+                    else:
+                        self.service_connection(key, mask)
+        except:
+            print("ERROR: listen socket couldn't listen")
+
+    def start_server(self):
+        self.create_listening_socket()
+        self.is_socket_running = True
+
+        # Daemon thread terminates thread when the main porgram is terminated
+        self.connection_thread = threading.Thread(target=self.start_listening, daemon=True)
+        self.connection_thread.start()
+
+    def accept_new_connection(self):
+        try:
+            new_socket, address = self.lsock.accept()
+            new_socket.setblocking(False)
+            data = PeerConnection(new_socket, address)
+            self.sel.register(new_socket, selectors.EVENT_READ | selectors.EVENT_WRITE, data = data)
+        except:
+            print("ERROR: new connection not accepted")
+
+    def service_connection(self, key, mask):
+        connection = key.data
+        sock = key.fileobj
+
+        if mask & selectors.EVENT_READ:
+            try: 
+                # Reading 4096 bytes as it is common due to its balance between effeciency and performance
+                chunk_read = sock.recv(4096)
+                if chunk_read:
+                    connection.inbound_buffer += chunk_read
+                    self.process_message(connection)
+                else:
+                    # If no data is passed (like b""), it means peer is requesting to close connection
+                    self.cleanup_connection(connection, sock)
+            except (BlockingIOError, ConnectionResetError):
+                self.cleanup_connection(connection, sock)
+
+        if mask & selectors.EVENT_WRITE and connection.outbound_buffer:
+            result = connection.send_buffered_data()
+            # Cleans up connection if it ended
+            if result is None:
+                self.cleanup_connection(connection, sock)
+
+    def process_message(self, connection):
+        # Check if there is a complete message
+        while connection.is_message_complete():
+            message = connection.extract_message()
+            if message:
+                self.handle_message(message, connection)
+
+    def handle_message(self, message, connection):
+        # Checking if message is already seen to prevent message getting stuck in loops
+        if message.message_id in self.seen_messages:
+            print("Ignoring seen message")
+            return
+        
+        self.seen_messages.add(message.message_id)
+
+        if message.message_type == "HANDSHAKE":
+            self.handle_handshake(message, connection)
+        elif message.message_type == "MESSAGE":
+            self.handle_user_message(message)
+        elif message.message_type == "PEER_LIST":
+            self.handle_peer_list(message)
+        elif message.message_type == "NETWORK_UPDATE":
+            self.handle_network_structure_message(message)
+
+    def handle_handshake(self, message, connection):
+        """
+        PSEUDOCODE:
+            Get peer id
+            Add peer id to connection
+            send a handshake response only if they are not in known peers
+            Add peer id to kown peers
+            call functions to update the network
+            send peer list
+        """
+
+        # Extract peer id from message
+        other_peer_id = message.peer_id
+
+        print(f"Handshake from {other_peer_id}")
+
+        # Add peer to current conenctions
+        self.connections[other_peer_id] = connection
+
+        # Send handshake if the received handshake is the first one (This prevents a infinite state in which the handshake is continously sent between peers)
+        if other_peer_id not in self.known_peers:
+            handshake_message = Message(peer_id=self.peer_id, target_user_id = other_peer_id, message_type="HANDSHAKE", data={"host": self.host, "port": self.port}, time_stamp=time.time())
+            connection.queue_message(handshake_message)
+
+        # Known peers is updated
+        self.known_peers[other_peer_id] = {
+            "host": message.data.get("host"),
+            "port": message.data.get("port"),
+        }
+
+        # Functions to update the network structure are called
+        self.router.update_peer_graph(other_peer_id)
+        self.router.update_routing_graph(self.known_peers)
+
+        # Socket data is updated
+        connection.peer_id = other_peer_id
+        connection.is_handshake_complete = True
+
+        # Peer list is sent
+        peer_list_message = Message(peer_id=self.peer_id, target_user_id=other_peer_id, message_type="PEER_LIST", data=self.known_peers, time_stamp=time.time())
+        connection.queue_message(peer_list_message)
+        network_message = Message(
+            peer_id=self.peer_id,
+            target_user_id=other_peer_id,
+            message_type="NETWORK_UPDATE",
+            data={"peer_graph": {key: list(value) for key, value in self.router.peer_graph.items()}},
+            time_stamp=time.time()
+        )
+        connection.queue_message(network_message)
+        for existing_peer_id, existing_connection in self.connections.items():
+            if existing_peer_id != other_peer_id and existing_connection.is_handshake_complete:
+                # Send the updated known_peers list to existing connections
+                updated_peer_list = Message(
+                    peer_id=self.peer_id,
+                    target_user_id=existing_peer_id,
+                    message_type="PEER_LIST",
+                    data=self.known_peers,
+                    time_stamp=time.time()
+                )
+                existing_connection.queue_message(updated_peer_list)
+                updated_network = Message(
+                    peer_id=self.peer_id,
+                    target_user_id=existing_peer_id,
+                    message_type="NETWORK_UPDATE",
+                    data={"peer_graph": {key: list(value) for key, value in self.router.peer_graph.items()}},
+                    time_stamp=time.time()
+                )
+                existing_connection.queue_message(updated_network)
+
+    def handle_user_message(self, message):
+        if message.target_user_id == self.peer_id:
+            print(f"Message from {message.peer_id}: {message.data.get('content', '')}")
+        else:
+            self.route_message(message)
+
+    def handle_peer_list(self, message):
+        peer_list = message.data
+        new_discoveries = 0
+        
+        for peer_id, peer_info in peer_list.items():
+            if peer_id != self.peer_id and peer_id not in self.known_peers:
+                self.known_peers[peer_id] = peer_info
+                new_discoveries += 1
+        
+        if new_discoveries > 0:
+            print(f"Peer {self.peer_id} discovered {new_discoveries} new peers")
+            self.router.update_routing_graph(self.known_peers)
+
+    def handle_network_structure_message(self, message):
+        """
+        Handles updated network structure information from peers
+        This is to allow the BFS to carry out accurate routing
+        """
+        received_graph = message.data.get("peer_graph")
+        network_updated = False
+
+        for peer_id, neighbors in received_graph.items():
+            if peer_id not in self.router.peer_graph:
+                self.router.peer_graph[peer_id] = set()
+                network_updated = True
+
+            for neighbor in neighbors:
+                if neighbor not in self.router.peer_graph:
+                    self.router.peer_graph[neighbor] = set()
+
+                    if neighbor not in self.router.peer_graph[peer_id]:
+                        self.router.peer_graph[peer_id].add(neighbor)
+                        network_updated = True
+                        if peer_id not in self.router.peer_graph[neighbor]:
+                            self.router.peer_graph[neighbor].add(peer_id)
+                            network_updated = True
+            
+            if network_updated:
+                print("Network updated")
+                self.router.update_routing_graph(self.known_peers)
+
+    def route_message(self, message):
+        target = message.target_user_id
+
+        # Gets the next hop on the path
+        next_hop = self.router.routing_graph.get(target)
+        
+        if next_hop is None:
+            print(f"No route to {target}")
+            return False
+        
+        if next_hop in self.connections:
+            message.add_hop(self.peer_id)
+            self.connections[next_hop].queue_message(message) 
+            print(f"Forwarded message for {target} via {next_hop}")
+            return True
+        else:
+            print(f"Next hop {next_hop} not connected")
+            return False
+
+    def send_message(self, message):
+        target = message.target_user_id
+        
+        if target in self.connections and target != self.peer_id:
+            message.add_hop(self.peer_id)
+            self.connections[target].queue_message(message)
+            print(f"Sent direct message to {target}")
+            return True
+        else:
+            return self.route_message(message)
+
+    def connect_to_peer(self, host, port):
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.setblocking(False)
+            
+            result = sock.connect_ex((host, port))
+            if result != 0 and result != 10035:
+                sock.close()
+                print(f"Failed to connect to {host}:{port}")
+                return False
+            
+            # Creating connection and registeingr with selector
+            connection = PeerConnection(sock, address=(host, port))
+            self.sel.register(sock, selectors.EVENT_READ | selectors.EVENT_WRITE, data=connection)
+            
+            # Send handshake
+            handshake = Message(self.peer_id, None, "HANDSHAKE", {"host": self.host, "port": self.port}, time.time())
+            connection.queue_message(handshake)
+            
+            print(f"Connecting to {host}:{port}...")
+            return True
+            
+        except Exception as e:
+            print(f"Connection error: {e}")
+            return False
+        
+    def cleanup_connection(self, connection, sock):
+        """
+        Removes connection and peer from memeory and from router
+        """
+        self.sel.unregister(sock)
+        sock.close()
+        if connection.peer_id:
+            self.connections.pop(connection.peer_id, None)
+            self.known_peers.pop(connection.peer_id, None)
+            self.router.remove_peer(connection.peer_id)
+        print(f"Cleaned up connection {connection.address}")
+   
+    def close_current_peer(self):
+        """
+        Closes the current peer
+        """
+        print("Closing down peer...")
+        self.is_socket_running = False
+        
+        # Close all peer connections with current peer
+        for connection in list(self.connections.values()):
+            try:
+                connection.socket.close()
+            except:
+                pass
+        
+        # Closes listening socket
+        if self.lsock:
+            try:
+                self.sel.unregister(self.lsock)
+                self.lsock.close()
+            except:
+                pass
+        
+        # Closes selector
+        try:
+            self.sel.close()
+        except:
+            pass
+        
+        print("Peer closing complete")
 
 class PeerConnection:
     # Setting maximum buffer size as 1 MB
@@ -262,346 +586,201 @@ class Router:
             if other_peer_id in connection:
                 connection.remove(other_peer_id)
 
-class Peer:
-    def __init__(self, host, port):
-        self.host = host
-        self.port = port
-        self.peer_id = uuid.uuid4().hex[:8]
-        self.sel = selectors.DefaultSelector()
-        self.is_socket_running = False
-        # Listening socket
-        self.lsock = None
-        self.router = Router(self.peer_id)
-        self.known_peers = {}
-        self.connections = {}
-        self.seen_messages = set()
+class cli_interface:
+    def __init__(self, peer):
+        self.peer = peer
+        self.running = True
 
-    def create_listening_socket(self):
+    def print_help(self):
         """
-        Creates listening socket with TCP connection
-        Options set so that address can be reused without error
-        Non-blocking socket
+        Displays the help text 
         """
-        self.lsock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        # Prevents "Address already in use" errors
-        self.lsock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self.lsock.bind((self.host, self.port))
-        # Member can only listen for 5 peers at a time 
-        self.lsock.listen(5)
-        self.lsock.setblocking(False)
-        self.sel.register(self.lsock, selectors.EVENT_READ, data="LISTEN")
-        print(f"Listening socket created for member {self.peer_id}")
-
-    def start_listening(self):
+        help_text = """
+            Available Commands:
+            connect (host) (port) - Connect to another peer
+            send (peer_id) (message) - Send message to peer
+            list - Show known peers and status
+            status - Display system statistics
+            help - Show command help
+            quit - Graceful shutdown
         """
-        Listening socket checks for whether incoming request is by previous client or a new client
+        print(help_text)
+
+    def cmd_connect(self, args):
         """
-        try:
-            while self.is_socket_running:
-                events = self.sel.select(timeout=1)
-                for key, mask in events:
-                    if key.data == "LISTEN":
-                        self.accept_new_connection()
-                    else:
-                        self.service_connection(key, mask)
-        except:
-            print("ERROR: listen socket couldn't listen")
-
-    def start_server(self):
-        self.create_listening_socket()
-        self.is_socket_running = True
-
-        # Daemon thread terminates thread when the main porgram is terminated
-        self.connection_thread = threading.Thread(target=self.start_listening, daemon=True)
-        self.connection_thread.start()
-
-    def accept_new_connection(self):
-        try:
-            new_socket, address = self.lsock.accept()
-            new_socket.setblocking(False)
-            data = PeerConnection(new_socket, address)
-            self.sel.register(new_socket, selectors.EVENT_READ | selectors.EVENT_WRITE, data = data)
-        except:
-            print("ERROR: new connection not accepted")
-
-    def service_connection(self, key, mask):
-        connection = key.data
-        sock = key.fileobj
-
-        if mask & selectors.EVENT_READ:
-            try: 
-                # Reading 4096 bytes as it is common due to its balance between effeciency and performance
-                chunk_read = sock.recv(4096)
-                if chunk_read:
-                    connection.inbound_buffer += chunk_read
-                    self.process_message(connection)
-                else:
-                    # If no data is passed (like b""), it means peer is requesting to close connection
-                    self.sel.unregister(sock)
-                    sock.close()
-            except (BlockingIOError, ConnectionResetError):
-                self.cleanup_connection(connection, sock)
-
-        if mask & selectors.EVENT_WRITE and connection.outbound_buffer:
-            result = connection.send_buffered_data()
-            # Cleans up connection if it ended
-            if result is None:
-                self.cleanup_connection(connection, sock)
-
-    def process_message(self, connection):
-        # Check if there is a complete message
-        while connection.is_message_complete():
-            message = connection.extract_message()
-            if message:
-                self.handle_message(message, connection)
-
-    def handle_message(self, message, connection):
-        # Checking if message is already seen to prevent message getting stuck in loops
-        if message.message_id in self.seen_messages:
-            print("Ignoring seen message")
+        Handle connect command
+        """
+        if len(args) != 2:
+            print("Usage: connect (host) (port)")
             return
         
-        self.seen_messages.add(message.message_id)
-
-        if message.message_type == "HANDSHAKE":
-            self.handle_handshake(message, connection)
-        elif message.message_type == "MESSAGE":
-            self.handle_user_message(message)
-        elif message.message_type == "PEER_LIST":
-            self.handle_peer_list(message)
-
-    def handle_handshake(self, message, connection):
-        """
-        PSEUDOCODE:
-            Get peer id
-            Add peer id to connection
-            send a handshake response only if they are not in known peers
-            Add peer id to kown peers
-            call functions to update the network
-            send peer list
-        """
-
-        # Extract peer id from message
-        other_peer_id = message.peer_id
-
-        print(f"Handshake from {other_peer_id}")
-
-        # Add peer to current conenctions
-        self.connections[other_peer_id] = connection
-
-        # Send handshake if the received handshake is the first one (This prevents a infinite state in which the handshake is continously sent between peers)
-        if other_peer_id not in self.known_peers:
-            handshake_message = Message(peer_id=self.peer_id, target_user_id = other_peer_id, message_type="HANDSHAKE", data={"host": self.host, "port": self.port}, time_stamp=time.time())
-            connection.queue_message(handshake_message)
-
-        # Known peers is updated
-        self.known_peers[other_peer_id] = {
-            "host": message.data.get("host"),
-            "port": message.data.get("port"),
-        }
-
-        # Functions to update the network structure are called
-        self.router.update_peer_graph(other_peer_id)
-        self.router.update_routing_graph(self.known_peers)
-
-        # Socket data is updated
-        connection.peer_id = other_peer_id
-        connection.is_handshake_complete = True
-
-        # Peer list is sent
-        peer_list_message = Message(peer_id=self.peer_id, target_user_id=other_peer_id, message_type="PEER_LIST", data=self.known_peers, time_stamp=time.time())
-        connection.queue_message(peer_list_message)
-
-        for existing_peer_id, existing_connection in self.connections.items():
-            if existing_peer_id != other_peer_id and existing_connection.is_handshake_complete:
-                # Send the updated known_peers list to existing connections
-                updated_peer_list = Message(
-                    peer_id=self.peer_id,
-                    target_user_id=existing_peer_id,
-                    message_type="PEER_LIST",
-                    data=self.known_peers,
-                    time_stamp=time.time()
-                )
-                existing_connection.queue_message(updated_peer_list)
-
-    def handle_user_message(self, message):
-        if message.target_user_id == self.peer_id:
-            print(f"Message from {message.peer_id}: {message.data.get('content', '')}")
-        else:
-            self.route_message(message)
-
-    def handle_peer_list(self, message):
-        peer_list = message.data
-        new_discoveries = 0
-        
-        for peer_id, peer_info in peer_list.items():
-            if peer_id != self.peer_id and peer_id not in self.known_peers:
-                self.known_peers[peer_id] = peer_info
-                new_discoveries += 1
-        
-        if new_discoveries > 0:
-            print(f"Discovered {new_discoveries} new peers")
-
-            for peer_id in self.known_peers:
-                if peer_id != self.peer_id and peer_id not in self.router.peer_graph:
-                    self.router.update_peer_graph(peer_id)
-
-            self.router.update_routing_graph(self.known_peers)
-
-    def route_message(self, message):
-        target = message.target_user_id
-
-        # Gets the next hop on the path
-        next_hop = self.router.routing_graph.get(target)
-        
-        if next_hop is None:
-            print(f"No route to {target}")
-            return False
-        
-        if next_hop in self.connections:
-            message.add_hop(self.peer_id)
-            self.connections[next_hop].queue_message(message) 
-            print(f"Forwarded message for {target} via {next_hop}")
-            return True
-        else:
-            print(f"Next hop {next_hop} not connected")
-            return False
-
-    def send_message(self, message):
-        target = message.target_user_id
-        
-        if target in self.connections and target != self.peer_id:
-            message.add_hop(self.peer_id)
-            self.connections[target].queue_message(message)
-            print(f"Sent direct message to {target}")
-            return True
-        else:
-            return self.route_message(message)
-
-    def connect_to_peer(self, host, port):
+        host = args[0]
         try:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.setblocking(False)
+            port = int(args[1])
+        except ValueError:
+            print("Error: Port must be a number")
+            return
             
-            result = sock.connect_ex((host, port))
-            if result != 0 and result != 10035:
-                sock.close()
-                print(f"Failed to connect to {host}:{port}")
-                return False
-            
-            # Creating connection and registeingr with selector
-            connection = PeerConnection(sock, address=(host, port))
-            self.sel.register(sock, selectors.EVENT_READ | selectors.EVENT_WRITE, data=connection)
-            
-            # Send handshake
-            handshake = Message(self.peer_id, None, "HANDSHAKE", {"host": self.host, "port": self.port}, time.time())
-            connection.queue_message(handshake)
-            
-            print(f"Connecting to {host}:{port}...")
-            return True
-            
-        except Exception as e:
-            print(f"Connection error: {e}")
-            return False
-        
-    def cleanup_connection(self, connection, sock):
-        """
-        Removes connection and peer from memeory and from router
-        """
-        self.sel.unregister(sock)
-        sock.close()
-        if connection.peer_id:
-            self.connections.pop(connection.peer_id, None)
-            self.known_peers.pop(connection.peer_id, None)
-            self.router.remove_peer(connection.peer_id)
-        print(f"Cleaned up connection {connection.address}")
+        success = self.peer.connect_to_peer(host, port)
+        if success:
+            print(f"Connection initiated to {host} {port}")
+        else:
+            print(f"Failed to connect to {host} {port}")
 
+    def cmd_send(self, args):
+        """
+        Handle send message command
+        """
+        if len(args) < 2:
+            print("Usage: send (peer_id) (message)")
+            return
+        
+        target_peer_id = args[0]
+        message_content = " ".join(args[1:])
+        
+        if target_peer_id not in self.peer.known_peers and target_peer_id not in self.peer.connections:
+            print(f"Unknown peer: {target_peer_id}")
+            return
+        
+        message = Message(
+            peer_id=self.peer.peer_id,
+            target_user_id=target_peer_id,
+            message_type="MESSAGE",
+            data={"content": message_content},
+            time_stamp=time.time()
+        )
+        
+        success = self.peer.send_message(message)
+        if success:
+            print(f"Message sent to {target_peer_id}")
+        else:
+            print(f"Failed to send message to {target_peer_id}")
+
+    def cmd_list(self, args):
+        """
+        Handle list peers command
+        """
+        print(f"___Peer List for {self.peer.peer_id}___")
+        print(f"Listening on: {self.peer.host}:{self.peer.port}")
+        
+        print(f"\nConnected Peers ({len(self.peer.connections)}):")
+        if self.peer.connections:
+            for peer_id, connection in self.peer.connections.items():
+                status = "Connected" if connection.is_handshake_complete else "Connecting"
+                print(f"  {peer_id} - {connection.address} ({status})")
+        else:
+            print("None")
+        
+        print(f"\nKnown Peers ({len(self.peer.known_peers)}):")
+        if self.peer.known_peers:
+            for peer_id, info in self.peer.known_peers.items():
+                connected = "Yes" if peer_id in self.peer.connections else "No"
+                print(f"  {peer_id} - {info['host']}:{info['port']} (Connected: {connected})")
+        else:
+            print("None")
+
+    def cmd_status(self, args):
+        """
+        Handle status command
+        """
+        print(f"\n___System Status___")
+        print(f"Peer ID: {self.peer.peer_id}")
+        print(f"Listening: {self.peer.host}:{self.peer.port}")
+        print(f"Status: {'Running' if self.peer.is_socket_running else 'Stopped'}")
+        print(f"Connected Peers: {len(self.peer.connections)}")
+        print(f"Known Peers: {len(self.peer.known_peers)}")
+        print(f"Routing Entries: {len(self.peer.router.routing_graph)}")
+        print(f"Seen Messages: {len(self.peer.seen_messages)}")
+        
+        # Shows routing table
+        if self.peer.router.routing_graph:
+            print(f"\nRouting Table:")
+            for target, next_hop in self.peer.router.routing_graph.items():
+                print(f"  To {target} via {next_hop}")
+        else:
+            print(f"\nRouting Table: Empty")
+
+    def cmd_quit(self, args):
+        """
+        Handle quit command
+        """
+        print("Shutting down...")
+        self.running = False
+        self.peer.close_current_peer()
+
+    def cmd_help(self, args):
+        """
+        Handle help command
+        """
+        self.print_help()
+
+    def parse_command(self, user_input):
+        """
+        Parse and execute user command
+        """
+        user_input = user_input.strip()
+        
+        if not user_input:
+            return
+        
+        # Split input into command and arguments
+        parts = user_input.split()
+        command = parts[0].lower()
+        args = parts[1:]
+        
+        # Commands dictionary
+        commands = {
+            'connect': self.cmd_connect,
+            'send': self.cmd_send,
+            'list': self.cmd_list,
+            'status': self.cmd_status,
+            'help': self.cmd_help,
+            'quit': self.cmd_quit,
+            # Adding additional command to quit
+            'exit': self.cmd_quit,
+        }
+        
+        if command in commands:
+            commands[command](args)
+        else:
+            print(f"Unknown command: '{command}'. Type 'help' for available commands.")
+
+    def run(self):
+        """
+        Main CLI loop
+        """
+        print(f"___P2P Network CLI___")
+        print(f"Peer ID: {self.peer.peer_id}")
+        print(f"Listening on: {self.peer.host}:{self.peer.port}")
+        print("Type 'help' for available commands.")
+        
+        while self.running:
+            try:
+                user_input = input(f"\n[{self.peer.peer_id}]> ")
+                if user_input:
+                    self.parse_command(user_input)
+            except KeyboardInterrupt:
+                print("\nReceived Ctrl+C, shutting down...")
+                self.cmd_quit([])
+                break
+
+def main():
+    if len(sys.argv) != 3:
+        print("Usage: python main.py (host) (port)")
+        sys.exit(1)
+    
+    try:
+        host = sys.argv[1]
+        port = int(sys.argv[2])
+    except ValueError:
+        print("Error: Port must be a number")
+        sys.exit(1)
+    
+    peer = Peer(host, port)
+    peer.start_server()
+    
+    cli = cli_interface(peer)
+    cli.run()
 
 if __name__ == "__main__":
-    def test1():
-        print("___Test 1: Basic Connection___")
-        
-        # Create two peers
-        peer1 = Peer("localhost", 8001)
-        peer2 = Peer("localhost", 8002)
-        
-        peer1.start_server()
-        peer2.start_server()
-        
-        print(f"Peer1 ID: {peer1.peer_id}")
-        print(f"Peer2 ID: {peer2.peer_id}")
-        
-        time.sleep(0.5)
-        
-        success = peer2.connect_to_peer("localhost", 8001)
-        if success:
-            print("Connection initiated successfully")
-        
-        time.sleep(1)
-        
-        print(f"Peer1 known peers: {list(peer1.known_peers.keys())}")
-        print(f"Peer2 known peers: {list(peer2.known_peers.keys())}")
-        
-    def test2():
-        print("__Test 2: Message routing")
-        
-        # Create three peers for routing test
-        peer1 = Peer("localhost", 8003)
-        peer2 = Peer("localhost", 8004) 
-        peer3 = Peer("localhost", 8005)
-        
-        # Start all servers
-        peer1.start_server()
-        peer2.start_server()
-        peer3.start_server()
-        
-        print(f"Peer1 ID: {peer1.peer_id}")
-        print(f"Peer2 ID: {peer2.peer_id}")
-        print(f"Peer3 ID: {peer3.peer_id}")
-        
-        time.sleep(0.5)
-
-        # Establishing network        
-        peer1.connect_to_peer("localhost", 8004) 
-        time.sleep(0.5)
-        peer2.connect_to_peer("localhost", 8005)
-        time.sleep(1.5)
-        
-        print("Network established")
-        print(f"Peer1 knows: {list(peer1.known_peers.keys())}")
-        print(f"Peer2 knows: {list(peer2.known_peers.keys())}")
-        print(f"Peer3 knows: {list(peer3.known_peers.keys())}")
-        
-        # Test direct messages (peer1 to peer2)
-        print("__Testing direct message___")
-        direct_message = Message(
-            peer_id=peer1.peer_id,
-            target_user_id=peer2.peer_id,
-            message_type="MESSAGE",
-            data={"content": "Hello from peer1 to peer2!"},
-            time_stamp=time.time()
-        )
-        peer1.send_message(direct_message)
-        
-        time.sleep(0.5)
-        
-        # Test routed message (peer1 to peer3 via peer2)
-        print("___Testing routed message___")
-        routed_message = Message(
-            peer_id=peer1.peer_id,
-            target_user_id=peer3.peer_id,
-            message_type="MESSAGE",
-            data={"content": "Hello from peer1 to peer3 via routing!"},
-            time_stamp=time.time()
-        )
-        peer1.send_message(routed_message)
-        
-        time.sleep(0.5)
-
-        print(f"Peer 1 knows: {peer1.known_peers.keys()}")
-        print(f"Peer 2 knows: {peer2.known_peers.keys()}")
-        print(f"Peer 3 knows: {peer3.known_peers.keys()}")
-
-        return peer1, peer2, peer3
-
-    test2()
+    main()
