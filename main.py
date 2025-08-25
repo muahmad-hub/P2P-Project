@@ -698,6 +698,28 @@ class MessageStore:
 
         return messages
 
+    def get_all_pending_messages(self):
+        connection = sqlite3.connect()
+        cursor = connection.cursor()
+
+        cursor.execute("""
+        SELECT o.id, o.peer_id, o.target_user_id, o.message_type, o.data, 
+            o.time_stamp, o.message_id, o.hop_count, o.path,
+            s.last_tried, s.retry_count, s.expiry_time
+        FROM offline_messages o
+        JOIN schedule_messages s ON o.message_id = s.message_id
+        WHERE s.expiry_time > ?
+        """, (time.time()))
+
+        result_raw = cursor.fetchall()
+        connection.close()
+
+        messages = []
+        for result in result_raw:
+            messages.append(self.data_to_message_class(result))
+
+        return messages
+
     def get_message_by_id(self, message_id):
         connection = sqlite3.connect(self.database_path)
         cursor = connection.cursor()
@@ -988,7 +1010,6 @@ class cli_interface:
         else:
             print(f"Message queued for {target_peer_id} (will retry when peer comes online)")
 
-
     def cmd_list(self, args):
         """
         Handle list peers command
@@ -1047,6 +1068,25 @@ class cli_interface:
         """
         self.print_help()
 
+    def cmd_queued_messages(self, args):
+        pending = self.peer.message_store.get_all_pending()
+        
+        print("\n___Queued Messages___")
+        if not pending:
+            print("No pending messages.")
+            return
+
+        print(f"{len(pending)} message(s) in queue:")
+        for message in pending:
+            target = message.target_user_id
+            content = message.data.get('content')
+            retry = getattr(message, 'retry_count', 0)
+            created = getattr(message, 'created_at', 'Unknown')
+            
+            print(f"- To: {target}")
+            print(f"  Content: {content}...")
+            print(f"  Retry: {retry}, Queued: {created}")
+
     def parse_command(self, user_input):
         """
         Parse and execute user command
@@ -1071,6 +1111,7 @@ class cli_interface:
             'quit': self.cmd_quit,
             # Adding additional command to quit
             'exit': self.cmd_quit,
+            'queue': self.cmd_queued_messages,
         }
         
         if command in commands:
