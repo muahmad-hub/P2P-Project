@@ -2,6 +2,7 @@
 
 ## Table of Contents
 - [Motivation & Purpose](#motivation--purpose)
+- [Demo](#demo)
 - [Quick Overview](#quick-overview)
 - [Key Features](#key-features)
 - [Challenges](#challenges-faced)
@@ -12,6 +13,8 @@ In 2005, a devastating earthquake struck northern Pakistan, my country of origin
 That memory stayed with me. It made me wonder: what if people in disaster-prone areas could still connect even if central infrastructure failed?
 
 This project is a small step toward that idea. It is nowhere near disaster-ready—it’s a simple proof-of-concept—but it gave me hands-on experience with distributed systems, fault tolerance, and resilience. More importantly, it showed me how even small-scale technical experiments can connect to real-world humanitarian challenges.
+## Demo
+> **Demo:** https://youtu.be/VmvUyCWIB3w
 ## Quick Overview
 This is a peer-to-peer (P2P) distributed messaging system that allows nodes to communicate directly without relying on a central server.
 - **Network Type**: Partial mesh topology with automatic peer discovery and dynamic routing
@@ -19,7 +22,6 @@ This is a peer-to-peer (P2P) distributed messaging system that allows nodes to c
 - **Message Delivery**: Stores messages in queues and sends them with retry mechanisms for reliable delivery
 - **Interface**: Command-line interface (CLI) for user interaction
 >For more details: [Dev logs & Learning Journal](docs/dev-logs.md)
-
 ## Key Features:
 ### Core Networking
 - **Direct P2P Communication**: Each peer acts as a client, server, and router at the same time.
