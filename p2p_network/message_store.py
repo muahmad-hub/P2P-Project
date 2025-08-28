@@ -4,7 +4,6 @@ import time
 import os
 from message import Message
 
-
 class MessageStore:
     """
     Stores offline messages to send to users who aren't currently connected to the network
@@ -130,10 +129,28 @@ class MessageStore:
         for result in result_raw:
             messages.append(self.data_to_message_class(result))
 
+        self.delet_sent_messages(target_peer=target_peer)
+
         return messages
+    
+    def delet_sent_messages(self, target_peer):
+        connection = sqlite3.connect(self.database_path)
+        cursor = connection.cursor()
+
+        # Delete from offline_messages, and schedule_messages will be deleted automatically due to cascade
+        cursor.execute("""
+            DELETE FROM offline_messages
+            WHERE target_user_id = ? AND message_id IN (
+                SELECT message_id FROM schedule_messages WHERE expiry_time > ?
+            )
+        """, (target_peer, time.time()))
+
+        connection.commit()
+        connection.close()
+
 
     def get_all_pending_messages(self):
-        connection = sqlite3.connect()
+        connection = sqlite3.connect(self.database_path)
         cursor = connection.cursor()
 
         cursor.execute("""
@@ -143,7 +160,7 @@ class MessageStore:
         FROM offline_messages o
         JOIN schedule_messages s ON o.message_id = s.message_id
         WHERE s.expiry_time > ?
-        """, (time.time()))
+        """, (time.time(),))
 
         result_raw = cursor.fetchall()
         connection.close()

@@ -460,3 +460,26 @@ def cleanup_connection(self, connection, sock):
         self.router.remove_peer(connection.peer_id)
 ```
 - `self.known_peers.pop(connection.peer_id, None)` removed the peer from known peers when they disconnected and hence the message couldn't be queued for later
+
+## Date: August 26
+### BUG: Network updates were not global
+- I tested the network with 4 peers, each connected to each other, creating a ring-like network.
+- Only the final peer had the latest knowledge of the network, while Peer 1 did not know that Peer 4 existed
+- The problem was that the network updates only went to direct connections, while other peers did not have the full idea of what the network is and hence couldn't route the message effectively
+### Solution
+- I added the following code whenever network structure changes from direct peers were received:
+```python
+for existing_peer_id, existing_connection in self.connections.items():
+    if existing_peer_id != message.peer_id and existing_connection.is_handshake_complete:
+        updated_network = Message(
+            peer_id=self.peer_id,
+            target_user_id=existing_peer_id,
+            message_type="NETWORK_UPDATE",
+            data={"peer_graph": {key: list(value) for key, value in self.router.peer_graph.items()}},
+            time_stamp=time.time()
+        )
+        existing_connection.queue_message(updated_network)
+```
+
+## Date: August 27
+- After testing the code, the retry mechanism seemed to be redundant as it doesn't work untill a user reconnects to the nework through a handshake; however, when a handshake is intitiated, any queed messages are checked and sent. This makes the retry mechanism redundant. So currently, I have removed the retry mechanisma and left the handshake based offline message forwarding.

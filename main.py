@@ -153,7 +153,7 @@ class Peer:
         other_peer_id = message.peer_id
 
         print(f"Handshake from {other_peer_id}")
-        print
+        print(f"[{self.peer_id}]> ", end="", flush=True)
 
         # Add peer to current conenctions
         self.connections[other_peer_id] = connection
@@ -213,7 +213,8 @@ class Peer:
 
     def handle_user_message(self, message):
         if message.target_user_id == self.peer_id:
-            print(f"Message from {message.peer_id} at {message.time_stamp}: {message.data.get('content', '')}")
+            print(f"\nMessage from {message.peer_id}: {message.data.get('content', '')}")
+            print(f"[{self.peer_id}]> ", end="", flush=True)
         else:
             self.route_message(message)
 
@@ -228,7 +229,19 @@ class Peer:
         
         if new_discoveries > 0:
             print(f"Peer {self.peer_id} discovered {new_discoveries} new peers")
+            print(f"[{self.peer_id}]> ", end="", flush=True)
             self.router.update_routing_graph(self.known_peers)
+
+            for existing_peer_id, existing_connection in self.connections.items():
+                if existing_connection.is_handshake_complete:
+                    updated_peer_list = Message(
+                        peer_id=self.peer_id,
+                        target_user_id=existing_peer_id,
+                        message_type="PEER_LIST",
+                        data=self.known_peers,
+                        time_stamp=time.time()
+                    )
+                    existing_connection.queue_message(updated_peer_list)
 
     def handle_network_structure_message(self, message):
         """
@@ -246,17 +259,31 @@ class Peer:
             for neighbor in neighbors:
                 if neighbor not in self.router.peer_graph:
                     self.router.peer_graph[neighbor] = set()
+                    network_updated = True
 
-                    if neighbor not in self.router.peer_graph[peer_id]:
-                        self.router.peer_graph[peer_id].add(neighbor)
-                        network_updated = True
-                        if peer_id not in self.router.peer_graph[neighbor]:
-                            self.router.peer_graph[neighbor].add(peer_id)
-                            network_updated = True
+                if neighbor not in self.router.peer_graph[peer_id]:
+                    self.router.peer_graph[peer_id].add(neighbor)
+                    network_updated = True
+                if peer_id not in self.router.peer_graph[neighbor]:
+                    self.router.peer_graph[neighbor].add(peer_id)
+                    network_updated = True
+        
+        if network_updated:
+            print("Network updated")
+            print(f"[{self.peer_id}]> ", end="", flush=True)
+            self.router.update_routing_graph(self.known_peers)
             
-            if network_updated:
-                print("Network updated")
-                self.router.update_routing_graph(self.known_peers)
+            # Sends update to all connected users
+            for existing_peer_id, existing_connection in self.connections.items():
+                if existing_peer_id != message.peer_id and existing_connection.is_handshake_complete:
+                    updated_network = Message(
+                        peer_id=self.peer_id,
+                        target_user_id=existing_peer_id,
+                        message_type="NETWORK_UPDATE",
+                        data={"peer_graph": {key: list(value) for key, value in self.router.peer_graph.items()}},
+                        time_stamp=time.time()
+                    )
+                    existing_connection.queue_message(updated_network)
 
     def route_message(self, message):
         target = message.target_user_id
@@ -301,62 +328,62 @@ class Peer:
         """
         self.message_store.store_offline_message(message)
 
-        timer = threading.Timer(1.0, self.retry_sending_message, [message.message_id])
-        timer.start()
-        self.retry_scheduler[message.message_id] = timer
+        # timer = threading.Timer(1.0, self.retry_sending_message, [message.message_id])
+        # timer.start()
+        # self.retry_scheduler[message.message_id] = timer
 
-    def retry_sending_message(self, message_id):
-        """
-        PSEUDOCODE:
-            set a delay and retry_count limit
-            get stored message through message id
-            call route_message function
-            if success then print success message
-            else increment retry_count 
-            if retry_count limit is reached then stop sending messages for now
-            else retry sending the message
-        """
-        delay = 30.0
-        retry_count_limit = 10
+    # def retry_sending_message(self, message_id):
+    #     """
+    #     PSEUDOCODE:
+    #         set a delay and retry_count limit
+    #         get stored message through message id
+    #         call route_message function
+    #         if success then print success message
+    #         else increment retry_count 
+    #         if retry_count limit is reached then stop sending messages for now
+    #         else retry sending the message
+    #     """
+    #     delay = 2.0
+    #     retry_count_limit = 10
 
-        message = self.message_store.get_message_by_id(message_id)
+    #     message = self.message_store.get_message_by_id(message_id)
         
-        if not message:
-            print(f"Message {message_id} not found for retry")
-            return
+    #     if not message:
+    #         print(f"Message {message_id} not found for retry")
+    #         return
         
-        target = message.target_user_id
-        next_hop = self.router.routing_graph.get(target)
+    #     target = message.target_user_id
+    #     next_hop = self.router.routing_graph.get(target)
         
-        success = False
-        if next_hop and next_hop in self.connections:
-            message.add_hop(self.peer_id)
-            self.connections[next_hop].queue_message(message)
-            print(f"Successfully sent queued message to {target} via {next_hop}")
-            success = True
-        elif target in self.connections:
-            message.add_hop(self.peer_id)
-            self.connections[target].queue_message(message)
-            print(f"Successfully sent queued message directly to {target}")
-            success = True
+    #     success = False
+    #     if next_hop and next_hop in self.connections:
+    #         message.add_hop(self.peer_id)
+    #         self.connections[next_hop].queue_message(message)
+    #         print(f"Successfully sent queued message to {target} via {next_hop}")
+    #         success = True
+    #     elif target in self.connections:
+    #         message.add_hop(self.peer_id)
+    #         self.connections[target].queue_message(message)
+    #         print(f"Successfully sent queued message directly to {target}")
+    #         success = True
         
-        if success:
-            self.message_store.delete_message_by_id(message_id)
-            if message_id in self.retry_scheduler:
-                self.retry_scheduler.pop(message_id, None)
-        else:
-            retry_count = self.message_store.increment_retry_count(message_id)
-            print(f"Retry attempt {retry_count} failed for message to {target}")
+    #     if success:
+    #         self.message_store.delete_message_by_id(message_id)
+    #         if message_id in self.retry_scheduler:
+    #             self.retry_scheduler.pop(message_id, None)
+    #     else:
+    #         retry_count = self.message_store.increment_retry_count(message_id)
+    #         print(f"Retry attempt {retry_count} failed for message to {target}")
 
-            if retry_count >= retry_count_limit:
-                print(f"Retry limit reached for message to {target}, stopping retries")
-                self.message_store.delete_message_by_id(message_id)
-                if message_id in self.retry_scheduler:
-                    self.retry_scheduler.pop(message_id, None)
-            else:
-                timer = threading.Timer(delay, self.retry_sending_message, [message_id])
-                timer.start()
-                self.retry_scheduler[message_id] = timer
+    #         if retry_count >= retry_count_limit:
+    #             print(f"Retry limit reached for message to {target}, stopping retries")
+    #             self.message_store.delete_message_by_id(message_id)
+    #             if message_id in self.retry_scheduler:
+    #                 self.retry_scheduler.pop(message_id, None)
+    #         else:
+    #             timer = threading.Timer(delay, self.retry_sending_message, [message_id])
+    #             timer.start()
+    #             self.retry_scheduler[message_id] = timer
 
     def deliver_queued_messages(self, target_peer):
         messages = self.message_store.get_pending_messages(target_peer)
@@ -396,13 +423,31 @@ class Peer:
         
     def cleanup_connection(self, connection, sock):
         """
-        Removes connection and peer from memeory and from router
+        Removes connection and peer from memory and from router
         """
         self.sel.unregister(sock)
         sock.close()
         if connection.peer_id:
-            self.connections.pop(connection.peer_id, None)
-            self.router.remove_peer(connection.peer_id)
+            # Remove from connections and router
+            disconnected_peer = connection.peer_id
+            self.connections.pop(disconnected_peer, None)
+            self.router.remove_peer(disconnected_peer)
+            
+            # update routing graph
+            self.router.update_routing_graph(self.known_peers)
+            
+            # share changes with all connected peers
+            for existing_peer_id, existing_connection in self.connections.items():
+                if existing_connection.is_handshake_complete:
+                    network_update_message = Message(
+                        peer_id=self.peer_id,
+                        target_user_id=existing_peer_id,
+                        message_type="NETWORK_UPDATE",
+                        data={"peer_graph": {key: list(value) for key, value in self.router.peer_graph.items()}},
+                        time_stamp=time.time()
+                    )
+                    existing_connection.queue_message(network_update_message)
+            
         print(f"\nCleaned up connection {connection.address}")
    
     def close_current_peer(self):
@@ -696,10 +741,28 @@ class MessageStore:
         for result in result_raw:
             messages.append(self.data_to_message_class(result))
 
+        self.delet_sent_messages(target_peer=target_peer)
+
         return messages
+    
+    def delet_sent_messages(self, target_peer):
+        connection = sqlite3.connect(self.database_path)
+        cursor = connection.cursor()
+
+        # Delete from offline_messages, and schedule_messages will be deleted automatically due to cascade
+        cursor.execute("""
+            DELETE FROM offline_messages
+            WHERE target_user_id = ? AND message_id IN (
+                SELECT message_id FROM schedule_messages WHERE expiry_time > ?
+            )
+        """, (target_peer, time.time()))
+
+        connection.commit()
+        connection.close()
+
 
     def get_all_pending_messages(self):
-        connection = sqlite3.connect()
+        connection = sqlite3.connect(self.database_path)
         cursor = connection.cursor()
 
         cursor.execute("""
@@ -709,7 +772,7 @@ class MessageStore:
         FROM offline_messages o
         JOIN schedule_messages s ON o.message_id = s.message_id
         WHERE s.expiry_time > ?
-        """, (time.time()))
+        """, (time.time(),))
 
         result_raw = cursor.fetchall()
         connection.close()
@@ -957,6 +1020,7 @@ class cli_interface:
             status - Display system statistics
             help - Show command help
             quit - Graceful shutdown
+            queue - shows queued messages
         """
         print(help_text)
 
@@ -1069,7 +1133,7 @@ class cli_interface:
         self.print_help()
 
     def cmd_queued_messages(self, args):
-        pending = self.peer.message_store.get_all_pending()
+        pending = self.peer.message_store.get_all_pending_messages()
         
         print("\n___Queued Messages___")
         if not pending:
@@ -1079,13 +1143,10 @@ class cli_interface:
         print(f"{len(pending)} message(s) in queue:")
         for message in pending:
             target = message.target_user_id
-            content = message.data.get('content')
-            retry = getattr(message, 'retry_count', 0)
-            created = getattr(message, 'created_at', 'Unknown')
-            
+            content = message.data.get('content', 'N/A')
             print(f"- To: {target}")
-            print(f"  Content: {content}...")
-            print(f"  Retry: {retry}, Queued: {created}")
+            print(f"  Content: {content}")
+            print(f"  Message ID: {message.message_id}")
 
     def parse_command(self, user_input):
         """
@@ -1119,6 +1180,10 @@ class cli_interface:
         else:
             print(f"Unknown command: '{command}'. Type 'help' for available commands.")
 
+    def show_prompt(self):
+        """Show the command prompt"""
+        print(f"\n[{self.peer.peer_id}]> ", end="", flush=True)
+
     def run(self):
         """
         Main CLI loop
@@ -1128,11 +1193,16 @@ class cli_interface:
         print(f"Listening on: {self.peer.host}:{self.peer.port}")
         print("Type 'help' for available commands.")
         
+        # Show initial prompt
+        self.show_prompt()
+        
         while self.running:
             try:
-                user_input = input(f"\n[{self.peer.peer_id}]> ")
-                if user_input:
+                user_input = input()
+                if user_input.strip():
                     self.parse_command(user_input)
+                if self.running:
+                    self.show_prompt()
             except KeyboardInterrupt:
                 print("\nReceived Ctrl+C, shutting down...")
                 self.cmd_quit([])

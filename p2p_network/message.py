@@ -2,7 +2,6 @@ import json
 import uuid
 import time
 
-
 class Message:
     """
     Stores:

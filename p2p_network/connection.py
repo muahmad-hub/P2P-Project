@@ -1,6 +1,5 @@
 from message import Message
 
-
 class PeerConnection:
     # Setting maximum buffer size as 1 MB
     MAX_BUFFER_SIZE = 1024 * 1024

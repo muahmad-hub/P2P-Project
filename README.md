@@ -11,7 +11,7 @@ In 2005, a devastating earthquake struck northern Pakistan, my country of origin
 
 That memory stayed with me. It made me wonder: what if people in disaster-prone areas could still connect even if central infrastructure failed?
 
-This project is a small step toward that idea. It’s not production-ready, but building it gave me hands-on experience with distributed systems, resilience, and fault tolerance—concepts I now see not just as technical challenges, but as life-saving possibilities.
+This project is a small step toward that idea. It is nowhere near disaster-ready—it’s a simple proof-of-concept—but it gave me hands-on experience with distributed systems, fault tolerance, and resilience. More importantly, it showed me how even small-scale technical experiments can connect to real-world humanitarian challenges.
 ## Quick Overview
 This is a peer-to-peer (P2P) distributed messaging system that allows nodes to communicate directly without relying on a central server.
 - **Network Type**: Partial mesh topology with automatic peer discovery and dynamic routing

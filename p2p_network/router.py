@@ -1,6 +1,5 @@
 from collections import deque
 
-
 class Router:
     def __init__(self, peer_id):
         # Dictionary of the which peer to route to depending on the target peer
